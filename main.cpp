@@ -1,5 +1,11 @@
+#include <condition_variable>
+using std::condition_variable;
+
 #include <exception>
 using std::exception;
+
+#include <functional>
+using std::function;
 
 #include <iostream>
 using std::cout;
@@ -9,19 +15,36 @@ using std::endl;
 using std::numeric_limits;
 
 #include <memory>
+using std::make_shared;
 using std::shared_ptr;
+
+#include <mutex>
+using std::mutex;
+using std::unique_lock;
+
+#include <queue>
+using std::queue;
 
 #include <thread>
 using std::thread;
 
+#include <utility>
+using std::move;
+
 #include <vector>
 using std::vector;
+
+#include <boost/asio/async_result.hpp>
+using boost::asio::async_completion;
 
 #include <boost/asio/buffer.hpp>
 using boost::asio::mutable_buffer;
 
 #include <boost/asio/buffered_stream.hpp>
 using boost::asio::buffered_stream;
+
+#include <boost/asio/handler_invoke_hook.hpp>
+using boost::asio::asio_handler_invoke;
 
 #include <boost/asio/io_service.hpp>
 using boost::asio::io_service;
@@ -41,10 +64,86 @@ namespace beast = boost::beast;
 #include <boost/beast/http.hpp>
 namespace http = beast::http;
 
+#include <boost/system/error_code.hpp>
+using boost::system::error_code;
+
+
+class work_queue {
+public:
+	work_queue(io_service& io) : io(io), pool((vector<thread>::size_type)(thread::hardware_concurrency())), stop(false) {
+		for (auto& thrd : pool) {
+			thrd = thread([this](){ run(); });
+		}
+	}
+
+	~work_queue() {
+		{
+			unique_lock<mutex> ul (mtx);
+			stop = true;
+			cond_var.notify_all();
+		}
+
+		for (auto& thrd : pool) {
+			thrd.join();
+		}
+	}
+
+	template<class Handler>
+	void async_run(function<void()> task, Handler&& handler) {
+		async_completion<Handler, void(error_code)> init(handler);
+
+		{
+			auto completion_handler (make_shared<decltype(init.completion_handler)>(init.completion_handler));
+			unique_lock<mutex> ul (mtx);
+			tasks.emplace(enqueued_task({move(task), [completion_handler](){ asio_handler_invoke(*completion_handler); }}));
+			cond_var.notify_all();
+		}
+
+		init.result.get();
+	}
+
+private:
+	struct enqueued_task {
+		function<void()> task;
+		function<void()> on_done;
+	};
+
+	mutex mtx;
+	condition_variable cond_var;
+	io_service& io;
+	queue<enqueued_task> tasks;
+	vector<thread> pool;
+	bool stop;
+
+	void run() {
+		unique_lock<mutex> ul (mtx);
+
+		while (!stop) {
+			while (!tasks.empty()) {
+				auto task (move(tasks.front()));
+				tasks.pop();
+
+				ul.unlock();
+
+				try {
+					task.task();
+				} catch (...) {
+				}
+
+				io.post(move(task.on_done));
+
+				ul.lock();
+			}
+
+			cond_var.wait(ul);
+		}
+	}
+};
 
 int main() {
 	vector<thread> pool ((vector<thread>::size_type)(thread::hardware_concurrency()));
 	io_service io;
+	work_queue wq (io);
 	tcp::acceptor acceptor (io);
 	tcp::endpoint endpoint (tcp::v6(), 8910);
 
@@ -53,12 +152,12 @@ int main() {
 	acceptor.bind(endpoint);
 	acceptor.listen(numeric_limits<int>::max());
 
-	spawn(acceptor.get_io_context(), [&acceptor](yield_context yc) {
+	spawn(acceptor.get_io_context(), [&acceptor, &wq](yield_context yc) {
 		for (;;) {
 			shared_ptr<tcp::socket> peer (new tcp::socket(acceptor.get_io_context()));
 			acceptor.async_accept(*peer, yc);
 
-			spawn(acceptor.get_io_context(), [peer](yield_context yc) {
+			spawn(acceptor.get_io_context(), [peer, &wq](yield_context yc) {
 				try {
 					{
 						auto remote (peer->remote_endpoint());
@@ -91,10 +190,12 @@ int main() {
 
 								http::response<http::string_body> res;
 
-								res.result(http::status::internal_server_error);
-								res.set(http::field::content_type, "text/plain");
-								res.set(http::field::content_length, "36");
-								res.body() = "I like onions. They make people cry.";
+								wq.async_run([&req, &res](){
+									res.result(http::status::internal_server_error);
+									res.set(http::field::content_type, "text/plain");
+									res.set(http::field::content_length, "36");
+									res.body() = "I like onions. They make people cry.";
+								}, yc);
 
 								http::async_write(iobuf, res, yc);
 								iobuf.async_flush(yc);

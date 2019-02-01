@@ -3,7 +3,7 @@ project(grumpycathttpd)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
-find_package(Boost 1.48.0 COMPONENTS coroutine system REQUIRED)
+find_package(Boost 1.48.0 COMPONENTS coroutine date_time system REQUIRED)
 
 include_directories(${Boost_INCLUDE_DIRS})
 link_directories(${Boost_LIBRARY_DIRS})
